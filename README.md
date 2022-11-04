@@ -1,0 +1,47 @@
+https://huggingface.co/datasets/ChristophSchuhmann/improved_aesthetics_6plus/blob/main/data/train-00000-of-00007-29aec9150af50f9f.parquet
+
+- [ ] `parquet`: xFilter rowgroups on constraints https://github.com/RoaringBitmap/roaring-rs
+- [ ] read through multiple parquet files, multi-threading?
+
+- [x] `select * from parquet_metadata(file)`
+- [ ] `select * from parquet_columns(file)`
+- [ ] `select * from parquet_row_groups(file)`
+- [x] `select * from parquet_column_chunks(file)`
+
+- [ ] `using parquet_reader(schema, ...)`
+- [ ] `select * from parquet_column_values(file, column_name)`
+
+- [ ] `using parquet_storage()`
+
+```sql
+-- goal: store tabular data in parquet format within sqlite,
+-- to have column oriented + compressed data + hopefully fast queries.
+-- but this is awkward
+create table logs using parquet_storage();
+
+insert into logs(key, data)
+  select 'logs-2022-10-25', readfile('2022-10-25.parquet');
+
+
+
+```
+
+```sql
+select version, rows, rowgroups, columns, created_by, key_value_metadata
+from parquet_metadata_read('file.parquet');
+
+select rowid, size, compressed_size, num_rows, num_columns
+from parquet_row_groups_read('file.parquet');
+
+select name, path, logical_type, converted_type
+from parquet_columns_read('file.parquet');
+
+select row_group, column_name, min, max
+from parquet_stats_read('file.parquet');
+
+```
+
+```sql
+select value
+from parquet_column_values(readfile('test.parquet'), 'col_name')
+```
