@@ -1,47 +1,34 @@
-https://huggingface.co/datasets/ChristophSchuhmann/improved_aesthetics_6plus/blob/main/data/train-00000-of-00007-29aec9150af50f9f.parquet
+# sqlite-parquet
 
-- [ ] `parquet`: xFilter rowgroups on constraints https://github.com/RoaringBitmap/roaring-rs
-- [ ] read through multiple parquet files, multi-threading?
+A work-in-progress SQLite extension for querying parquet files! Not meant to be widely shared.
 
-- [x] `select * from parquet_metadata(file)`
-- [ ] `select * from parquet_columns(file)`
-- [ ] `select * from parquet_row_groups(file)`
-- [x] `select * from parquet_column_chunks(file)`
-
-- [ ] `using parquet_reader(schema, ...)`
-- [ ] `select * from parquet_column_values(file, column_name)`
-
-- [ ] `using parquet_storage()`
+Once it's ready, you'll be able to do things like:
 
 ```sql
--- goal: store tabular data in parquet format within sqlite,
--- to have column oriented + compressed data + hopefully fast queries.
--- but this is awkward
-create table logs using parquet_storage();
+.load ./parquet0
 
-insert into logs(key, data)
-  select 'logs-2022-10-25', readfile('2022-10-25.parquet');
+create virtual table temp.taxi using parquet(filename="tests/data/taxi_2019_04.parquet");
 
+select
+  vendor_id,
+  pickup_at,
+  dropoff_at,
+  total_amount
+from temp.taxi
+limit 5;
 
+/*
+┌───────────┬─────────────────────────┬─────────────────────────┬──────────────────┐
+│ vendor_id │        pickup_at        │       dropoff_at        │   total_amount   │
+├───────────┼─────────────────────────┼─────────────────────────┼──────────────────┤
+│ 1         │ 2019-04-01 00:04:09.000 │ 2019-04-01 00:06:35.000 │ 8.80000019073486 │
+│ 1         │ 2019-04-01 00:22:45.000 │ 2019-04-01 00:25:43.000 │ 8.30000019073486 │
+│ 1         │ 2019-04-01 00:39:48.000 │ 2019-04-01 01:19:39.000 │ 47.75            │
+│ 1         │ 2019-04-01 00:35:32.000 │ 2019-04-01 00:37:11.000 │ 7.30000019073486 │
+│ 1         │ 2019-04-01 00:44:05.000 │ 2019-04-01 00:57:58.000 │ 23.1499996185303 │
+└───────────┴─────────────────────────┴─────────────────────────┴──────────────────┘
+*/
 
-```
-
-```sql
-select version, rows, rowgroups, columns, created_by, key_value_metadata
-from parquet_metadata_read('file.parquet');
-
-select rowid, size, compressed_size, num_rows, num_columns
-from parquet_row_groups_read('file.parquet');
-
-select name, path, logical_type, converted_type
-from parquet_columns_read('file.parquet');
-
-select row_group, column_name, min, max
-from parquet_stats_read('file.parquet');
-
-```
-
-```sql
-select value
-from parquet_column_values(readfile('test.parquet'), 'col_name')
+select * from parquet_metadata('tests/data/taxi_2019_04.parquet');
+select * from parquet_column_chunks('tests/data/taxi_2019_04.parquet') limit 10;
 ```

@@ -5,12 +5,12 @@ use parquet::{
     },
     record::{reader::RowIter, Field, Row},
 };
-use sqlite3_loadable::{
-    errors::{BestIndexError, Result},
-    table::{SqliteXIndexInfo, VTab, VTabCursor, VTableArguments},
-    Error, SqliteContext, SqliteValue,
+use sqlite_loadable::prelude::*;
+use sqlite_loadable::{
+    api,
+    table::{ConstraintOperator, IndexInfo, VTab, VTabArguments, VTabCursor},
+    BestIndexError, Error, Result,
 };
-use sqlite3ext_sys::{sqlite3, sqlite3_vtab, sqlite3_vtab_cursor};
 
 use std::{fs::File, marker::PhantomData, mem, os::raw::c_int};
 
@@ -50,12 +50,12 @@ impl ParquetCursor<'_> {
     }
 }
 
-unsafe impl VTabCursor for ParquetCursor<'_> {
+impl VTabCursor for ParquetCursor<'_> {
     fn filter(
         &mut self,
         _idx_num: c_int,
         _idx_str: Option<&str>,
-        _values: Vec<SqliteValue>,
+        _values: &[*mut sqlite3_value],
     ) -> Result<()> {
         Ok(())
     }
@@ -75,86 +75,86 @@ unsafe impl VTabCursor for ParquetCursor<'_> {
         self.current.is_none()
     }
 
-    fn column(&self, ctx: SqliteContext, i: c_int) -> Result<()> {
+    fn column(&self, context: *mut sqlite3_context, i: c_int) -> Result<()> {
         let row = self.current.as_ref().unwrap();
         let field = row.get_column_iter().nth(i.try_into().unwrap()).unwrap().1;
         match field {
             Field::Null => {
-                ctx.result_null();
+                api::result_null(context);
             }
             Field::Bool(b) => {
-                ctx.result_bool(*b);
+                api::result_bool(context, *b);
             }
 
             Field::Byte(value) => {
-                ctx.result_int((*value).into());
+                api::result_int(context, (*value).into());
             }
             Field::UByte(value) => {
-                ctx.result_int((*value).into());
+                api::result_int(context, (*value).into());
             }
             Field::Short(value) => {
-                ctx.result_int((*value).into());
+                api::result_int(context, (*value).into());
             }
-            Field::UShort(value) => ctx.result_int((*value).into()),
+            Field::UShort(value) => api::result_int(context, (*value).into()),
             Field::Int(i) => {
-                ctx.result_int(*i);
+                api::result_int(context, *i);
             }
             Field::UInt(value) => match i32::try_from(*value) {
-                Ok(value) => ctx.result_int(value),
-                Err(_) => ctx.result_int64((*value).into()),
+                Ok(value) => api::result_int(context, value),
+                Err(_) => api::result_int64(context, (*value).into()),
             },
 
             Field::Long(value) => {
-                ctx.result_int64(*value);
+                api::result_int64(context, *value);
             }
             Field::ULong(value) => {
                 match i64::try_from(*value) {
-                    Ok(value) => ctx.result_int64(value),
+                    Ok(value) => api::result_int64(context, value),
                     Err(err) => {
                         return Err(Error::new_message(
-                            format!("Value too large: {}", err.to_string()).as_str(),
+                            format!("Value too large: {}", err).as_str(),
                         ))
                     }
                 };
             }
 
             Field::Double(value) => {
-                ctx.result_double(*value);
+                api::result_double(context, *value);
             }
             Field::Float(value) => {
-                ctx.result_double((*value).into());
+                api::result_double(context, (*value).into());
             }
             Field::Decimal(value) => {
                 //println!("{} {}", value.precision(), value.scale());
                 // TODO match on value, get i32/i64/bytes, then do something??
-                ctx.result_blob(value.data());
+                api::result_blob(context, value.data());
             }
 
             Field::Str(s) => {
-                ctx.result_text(s)?;
+                api::result_text(context, s)?;
             }
             Field::Bytes(b) => {
-                ctx.result_blob(b.data());
+                api::result_blob(context, b.data());
             }
             Field::ListInternal(_) | Field::Group(_) | Field::MapInternal(_) => {
-                ctx.result_json(field.to_json_value())?;
+                api::result_json(context, field.to_json_value())?;
             }
             Field::Date(value) => {
                 let ts = NaiveDate::from_num_days_from_ce(719163 + i32::try_from(*value).unwrap());
                 let f = ts.format("%Y-%m-%d");
-                ctx.result_text(&f.to_string())?;
+                api::result_text(context, &f.to_string())?;
             }
             Field::TimestampMillis(t) => {
-                ctx.result_int64((*t).try_into().unwrap());
+                api::result_int64(context, (*t).try_into().unwrap());
             }
             Field::TimestampMicros(t) => {
-                //ctx.result_int64((*t).try_into().unwrap());
+                //api::result_int64((*t).try_into().unwrap());
                 let ts = NaiveDateTime::from_timestamp(
                     (*t / 1000000).try_into().unwrap(),
                     u32::try_from(*t % 1000000).unwrap() * 1000,
                 );
                 let f = ts.format("%Y-%m-%d %H:%M:%S.%3f");
-                ctx.result_text(&f.to_string())?;
+                api::result_text(context, &f.to_string())?;
             }
         }
         Ok(())
@@ -172,14 +172,14 @@ pub struct ParquetTable {
     path: String,
 }
 
-unsafe impl<'vtab> VTab<'vtab> for ParquetTable {
+impl<'vtab> VTab<'vtab> for ParquetTable {
     type Aux = ();
     type Cursor = ParquetCursor<'vtab>;
 
     fn connect(
         _db: *mut sqlite3,
         _aux: Option<&()>,
-        args: VTableArguments,
+        args: VTabArguments,
     ) -> Result<(String, ParquetTable)> {
         let mut path = None;
         for arg in args.arguments {
@@ -203,19 +203,14 @@ unsafe impl<'vtab> VTab<'vtab> for ParquetTable {
         let metadata = reader.metadata();
         let schema = metadata.file_metadata().schema();
         let mut it = schema.get_fields().iter().peekable();
-        loop {
-            match it.next() {
-                Some(field) => {
-                    sql.push('"');
-                    sql.push_str(field.name());
-                    sql.push('"');
-                    if it.peek().is_some() {
-                        sql.push(',');
-                    }
-                }
-                None => break,
+
+        while let Some(field) = it.next() {
+            sql.push('"');
+            sql.push_str(field.name());
+            sql.push('"');
+            if it.peek().is_some() {
+                sql.push(',');
             }
-            //println!("{:?} {}", f.name(), f.get_physical_type().to_owned())
         }
         sql.push(')');
 
@@ -284,7 +279,7 @@ unsafe impl<'vtab> VTab<'vtab> for ParquetTable {
         Ok(())
     }
 
-    fn best_index(&self, mut info: SqliteXIndexInfo) -> core::result::Result<(), BestIndexError> {
+    fn best_index(&self, mut info: IndexInfo) -> core::result::Result<(), BestIndexError> {
         info.set_idxnum(1);
         info.set_estimated_rows(100000);
         info.set_estimated_cost(100000.0);
