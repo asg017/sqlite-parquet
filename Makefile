@@ -47,17 +47,17 @@ $(TARGET_LOADABLE): $(prefix) $(shell find . -type f -name '*.rs')
 	cp $(BUILT_LOCATION) $@
 
 $(TARGET_STATIC): $(prefix) $(shell find . -type f -name '*.rs')
-	cargo build 
+	cargo build
 	cp target/debug/$(LIBRARY_PREFIX)sqlite_parquet.a $@
 
 
 $(TARGET_LOADABLE_RELEASE): $(prefix) $(shell find . -type f -name '*.rs')
-	cargo build --release 
+	cargo build --release
 	cp target/release/$(LIBRARY_PREFIX)sqlite_parquet.$(LOADABLE_EXTENSION) $@
 
 $(TARGET_STATIC_RELEASE): $(prefix) $(shell find . -type f -name '*.rs')
-	cargo build 
-	cp target/debug/$(LIBRARY_PREFIX)sqlite_parquet.a $@
+	cargo build --release
+	cp target/release/$(LIBRARY_PREFIX)sqlite_parquet.a $@
 
 sqlite-parquet.h: cbindgen.toml
 	rustup run nightly cbindgen  --config $< -o $@
@@ -69,14 +69,14 @@ loadable-release: $(TARGET_LOADABLE_RELEASE)
 static: $(TARGET_STATIC)
 
 clean:
-	rm dist/*
+	rm -rf dist
 	cargo clean
 
 test-data:
-	mkdir -p tests/data
+	mkdir -p tests/data/glob tests/data/mismatch
 	duckdb < tests/generate_test_data.sql
 
-test:
+test: $(TARGET_LOADABLE)
 	python3 tests/test-loadable.py
 
 .PHONY: clean test test-data loadable static

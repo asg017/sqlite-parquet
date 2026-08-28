@@ -1,3 +1,5 @@
+//! `parquet_metadata(path_or_glob)`: one row of file-level metadata per matching file.
+
 use parquet::file::{
     metadata::ParquetMetaData, reader::FileReader, serialized_reader::SerializedFileReader,
 };
@@ -8,37 +10,112 @@ use sqlite_loadable::{
     BestIndexError, Error, Result,
 };
 
-use std::{fs::File, mem, os::raw::c_int};
+use std::{fs::File, mem, os::raw::c_int, path::PathBuf};
 
 static CREATE_SQL: &str = "CREATE TABLE x(
     source hidden,
-    version text,
+    path text,
+    version integer,
     created_by text,
-    schema text,
     num_rows integer,
     num_columns integer,
-    num_row_groups integer
+    num_row_groups integer,
+    schema text,
+    key_value_metadata text
   )";
+#[allow(clippy::enum_variant_names)]
 enum Columns {
     Source,
+    Path,
     Version,
     CreatedBy,
-    Schema,
     NumRows,
     NumColumns,
     NumRowGroups,
+    Schema,
+    KeyValueMetadata,
 }
 fn column(index: i32) -> Option<Columns> {
     match index {
         0 => Some(Columns::Source),
-        1 => Some(Columns::Version),
-        2 => Some(Columns::CreatedBy),
-        3 => Some(Columns::Schema),
+        1 => Some(Columns::Path),
+        2 => Some(Columns::Version),
+        3 => Some(Columns::CreatedBy),
         4 => Some(Columns::NumRows),
         5 => Some(Columns::NumColumns),
         6 => Some(Columns::NumRowGroups),
+        7 => Some(Columns::Schema),
+        8 => Some(Columns::KeyValueMetadata),
         _ => None,
     }
+}
+
+/// Expands a path or glob into the list of matching files, erroring when
+/// nothing matches. Shared by the metadata table functions.
+pub(crate) fn matching_files(pattern: &str) -> Result<Vec<PathBuf>> {
+    let paths = glob::glob(pattern)
+        .map_err(|e| Error::new_message(format!("invalid glob pattern '{}': {}", pattern, e)))?;
+    let mut files = Vec::new();
+    for entry in paths {
+        let path = entry.map_err(|e| Error::new_message(format!("glob error: {}", e)))?;
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    if files.is_empty() {
+        return Err(Error::new_message(format!(
+            "no files matched '{}'",
+            pattern
+        )));
+    }
+    Ok(files)
+}
+
+/// Reads only the footer of a parquet file.
+pub(crate) fn read_metadata(path: &std::path::Path) -> Result<ParquetMetaData> {
+    let display = path.display();
+    let file = File::open(path)
+        .map_err(|e| Error::new_message(format!("failed to open file '{}': {}", display, e)))?;
+    let reader = SerializedFileReader::new(file).map_err(|e| {
+        Error::new_message(format!("failed to read parquet file '{}': {}", display, e))
+    })?;
+    Ok(reader.metadata().clone())
+}
+
+/// `best_index` for table functions whose only argument is the hidden `source` column.
+pub(crate) fn source_best_index(
+    mut info: IndexInfo,
+    is_source: impl Fn(i32) -> bool,
+) -> core::result::Result<(), BestIndexError> {
+    let mut has_source = false;
+    for mut constraint in info.constraints() {
+        if is_source(constraint.column_idx()) {
+            if constraint.usable() && constraint.op() == Some(ConstraintOperator::EQ) {
+                constraint.set_omit(true);
+                constraint.set_argv_index(1);
+                has_source = true;
+            } else {
+                return Err(BestIndexError::Constraint);
+            }
+        }
+    }
+    if !has_source {
+        return Err(BestIndexError::Error);
+    }
+    info.set_estimated_cost(100.0);
+    info.set_estimated_rows(1);
+    info.set_idxnum(1);
+    Ok(())
+}
+
+pub(crate) fn source_argument(values: &[*mut sqlite3_value]) -> Result<&str> {
+    let value = values
+        .first()
+        .ok_or_else(|| Error::new_message("missing path argument"))?;
+    if api::value_is_null(value) {
+        return Err(Error::new_message("path argument must not be NULL"));
+    }
+    Ok(api::value_text(value)?)
 }
 
 #[repr(C)]
@@ -57,41 +134,20 @@ impl<'vtab> VTab<'vtab> for MetadataTable {
         _args: VTabArguments,
     ) -> Result<(String, MetadataTable)> {
         let base: sqlite3_vtab = unsafe { mem::zeroed() };
-        let vtab = MetadataTable { base };
-        Ok((CREATE_SQL.to_owned(), vtab))
-    }
-    fn destroy(&self) -> Result<()> {
-        Ok(())
+        Ok((CREATE_SQL.to_owned(), MetadataTable { base }))
     }
 
-    fn best_index(&self, mut info: IndexInfo) -> core::result::Result<(), BestIndexError> {
-        let mut has_source = false;
-        for mut constraint in info.constraints() {
-            match column(constraint.column_idx()) {
-                Some(Columns::Source) => {
-                    if constraint.usable() && constraint.op() == Some(ConstraintOperator::EQ) {
-                        constraint.set_omit(true);
-                        constraint.set_argv_index(1);
-                        has_source = true;
-                    } else {
-                        return Err(BestIndexError::Constraint);
-                    }
-                }
-                _ => (),
-            }
-        }
-        if !has_source {
-            return Err(BestIndexError::Error);
-        }
-        info.set_estimated_cost(100000.0);
-        info.set_estimated_rows(100000);
-        info.set_idxnum(1);
-
-        Ok(())
+    fn best_index(&self, info: IndexInfo) -> core::result::Result<(), BestIndexError> {
+        source_best_index(info, |i| matches!(column(i), Some(Columns::Source)))
     }
 
     fn open(&mut self) -> Result<MetadataCursor> {
-        Ok(MetadataCursor::new())
+        Ok(MetadataCursor {
+            base: unsafe { mem::zeroed() },
+            files: Vec::new(),
+            idx: 0,
+            current: None,
+        })
     }
 }
 
@@ -99,17 +155,18 @@ impl<'vtab> VTab<'vtab> for MetadataTable {
 pub struct MetadataCursor {
     /// Base class. Must be first
     base: sqlite3_vtab_cursor,
-    metadata: Option<ParquetMetaData>,
-    done: bool,
+    files: Vec<PathBuf>,
+    idx: usize,
+    current: Option<ParquetMetaData>,
 }
+
 impl MetadataCursor {
-    fn new() -> MetadataCursor {
-        let base: sqlite3_vtab_cursor = unsafe { mem::zeroed() };
-        MetadataCursor {
-            base,
-            metadata: None,
-            done: false,
-        }
+    fn load_current(&mut self) -> Result<()> {
+        self.current = match self.files.get(self.idx) {
+            Some(path) => Some(read_metadata(path)?),
+            None => None,
+        };
+        Ok(())
     }
 }
 
@@ -120,67 +177,65 @@ impl VTabCursor for MetadataCursor {
         _idx_str: Option<&str>,
         values: &[*mut sqlite3_value],
     ) -> Result<()> {
-        let path = api::value_text(values.get(0).ok_or_else(|| {
-            Error::new_message("missing source argument")
-        })?)?;
-        let file = File::open(&path).map_err(|e| {
-            Error::new_message(&format!("failed to open file '{}': {}", path, e))
-        })?;
-        let reader = SerializedFileReader::new(file).map_err(|e| {
-            Error::new_message(&format!("failed to read parquet file '{}': {}", path, e))
-        })?;
-        let metadata = reader.metadata();
-        self.metadata = Some(metadata.to_owned());
-        self.done = false;
-        Ok(())
+        self.files = matching_files(source_argument(values)?)?;
+        self.idx = 0;
+        self.load_current()
     }
 
     fn next(&mut self) -> Result<()> {
-        self.done = true;
-        Ok(())
+        self.idx += 1;
+        self.load_current()
     }
 
     fn eof(&self) -> bool {
-        self.done
+        self.idx >= self.files.len()
     }
 
     fn column(&self, context: *mut sqlite3_context, i: c_int) -> Result<()> {
-        let metadata = self.metadata.as_ref().ok_or_else(|| {
-            Error::new_message("no metadata available")
-        })?;
+        let metadata = self
+            .current
+            .as_ref()
+            .ok_or_else(|| Error::new_message("no metadata available"))?;
+        let file_metadata = metadata.file_metadata();
 
         match column(i) {
             Some(Columns::Source) => (),
-            Some(Columns::Version) => {
-                api::result_int(context, metadata.file_metadata().version());
+            Some(Columns::Path) => {
+                api::result_text(context, self.files[self.idx].to_string_lossy())?;
             }
+            Some(Columns::Version) => api::result_int(context, file_metadata.version()),
             Some(Columns::CreatedBy) => {
-                if let Some(created_by) = metadata.file_metadata().created_by() {
+                if let Some(created_by) = file_metadata.created_by() {
                     api::result_text(context, created_by)?;
                 }
             }
-            Some(Columns::Schema) => {
-                let mut buf = Vec::new();
-                parquet::schema::printer::print_schema(&mut buf, metadata.file_metadata().schema());
-                let s = String::from_utf8(buf).map_err(|e| {
-                    Error::new_message(&format!("invalid utf8 in schema: {}", e))
-                })?;
-                api::result_text(context, &s)?;
-            }
-            Some(Columns::NumRows) => {
-                api::result_int64(context, metadata.file_metadata().num_rows());
-            }
+            Some(Columns::NumRows) => api::result_int64(context, file_metadata.num_rows()),
             Some(Columns::NumColumns) => {
-                api::result_int64(
-                    context,
-                    metadata
-                        .file_metadata()
-                        .schema_descr()
-                        .num_columns() as i64,
-                );
+                api::result_int64(context, file_metadata.schema_descr().num_columns() as i64)
             }
             Some(Columns::NumRowGroups) => {
-                api::result_int64(context, metadata.num_row_groups() as i64);
+                api::result_int64(context, metadata.num_row_groups() as i64)
+            }
+            Some(Columns::Schema) => {
+                let mut buf = Vec::new();
+                parquet::schema::printer::print_schema(&mut buf, file_metadata.schema());
+                let s = String::from_utf8(buf)
+                    .map_err(|e| Error::new_message(format!("invalid utf8 in schema: {}", e)))?;
+                api::result_text(context, &s)?;
+            }
+            Some(Columns::KeyValueMetadata) => {
+                if let Some(kvs) = file_metadata.key_value_metadata() {
+                    let mut map = serde_json::Map::with_capacity(kvs.len());
+                    for kv in kvs {
+                        map.insert(
+                            kv.key.clone(),
+                            kv.value
+                                .clone()
+                                .map_or(serde_json::Value::Null, serde_json::Value::String),
+                        );
+                    }
+                    api::result_text(context, serde_json::Value::Object(map).to_string())?;
+                }
             }
             None => (),
         }
@@ -188,6 +243,6 @@ impl VTabCursor for MetadataCursor {
     }
 
     fn rowid(&self) -> Result<i64> {
-        Ok(1)
+        Ok(self.idx as i64 + 1)
     }
 }

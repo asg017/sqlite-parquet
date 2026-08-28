@@ -1,3 +1,5 @@
 target/
 dist/
 *.parquet
+# small test fixtures are committed
+!tests/data/**/*.parquet

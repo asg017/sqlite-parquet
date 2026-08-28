@@ -5,8 +5,9 @@ edition = "2021"
 
 [dependencies]
 sqlite-loadable = {path="../sqlite-loadable-rs", features=["exec"]}
-parquet = {version="57.3.0", default-features=false, features=["arrow", "json", "snap", "zstd"]}
-arrow = {version="57.3.0", default-features=false}
+# All compression codecs are enabled so arbitrary parquet files can be read.
+parquet = {version="59.2.0", default-features=false, features=["arrow", "snap", "zstd", "lz4", "brotli", "flate2-zlib-rs"]}
+arrow = {version="59.2.0", default-features=false}
 chrono = "0.4"
 serde_json = "1.0"
 glob = "0.3"
