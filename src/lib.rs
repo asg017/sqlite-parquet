@@ -5,7 +5,8 @@ mod parquet;
 
 use sqlite_loadable::prelude::*;
 use sqlite_loadable::{
-    define_scalar_function, define_table_function, define_virtual_table, FunctionFlags, Result,
+    api, define_scalar_function, define_table_function,
+    define_virtual_table_with_find, FunctionFlags, Result,
 };
 
 use crate::{
@@ -32,7 +33,11 @@ pub fn sqlite3_parquet_init(db: *mut sqlite3) -> Result<()> {
         FunctionFlags::DETERMINISTIC,
     )?;
 
-    define_virtual_table::<ParquetTable>(db, "parquet", None)?;
+    define_virtual_table_with_find::<ParquetTable>(db, "parquet0", None)?;
+    define_virtual_table_with_find::<ParquetTable>(db, "parquet", None)?;
+
+    api::overload_function(db, "parquet_path", 1)?;
+
     define_table_function::<MetadataTable>(db, "parquet_metadata", None)?;
     define_table_function::<ColumnChunksTable>(db, "parquet_column_chunks", None)?;
 

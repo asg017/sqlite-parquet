@@ -72,7 +72,11 @@ clean:
 	rm dist/*
 	cargo clean
 
+test-data:
+	mkdir -p tests/data
+	duckdb < tests/generate_test_data.sql
+
 test:
 	python3 tests/test-loadable.py
 
-.PHONY: clean test loadable static
+.PHONY: clean test test-data loadable static

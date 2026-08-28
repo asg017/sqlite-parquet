@@ -1,8 +1,5 @@
-use parquet::{
-    file::{
-        metadata::ParquetMetaData, reader::FileReader, serialized_reader::SerializedFileReader,
-    },
-    schema::printer,
+use parquet::file::{
+    metadata::ParquetMetaData, reader::FileReader, serialized_reader::SerializedFileReader,
 };
 use sqlite_loadable::prelude::*;
 use sqlite_loadable::{
@@ -14,11 +11,11 @@ use sqlite_loadable::{
 use std::{fs::File, mem, os::raw::c_int};
 
 static CREATE_SQL: &str = "CREATE TABLE x(
-    source hidden, 
+    source hidden,
     version text,
     created_by text,
     schema text,
-    num_rows integer, 
+    num_rows integer,
     num_columns integer,
     num_row_groups integer
   )";
@@ -61,7 +58,6 @@ impl<'vtab> VTab<'vtab> for MetadataTable {
     ) -> Result<(String, MetadataTable)> {
         let base: sqlite3_vtab = unsafe { mem::zeroed() };
         let vtab = MetadataTable { base };
-        // TODO db.config(VTabConfig::Innocuous)?;
         Ok((CREATE_SQL.to_owned(), vtab))
     }
     fn destroy(&self) -> Result<()> {
@@ -71,7 +67,6 @@ impl<'vtab> VTab<'vtab> for MetadataTable {
     fn best_index(&self, mut info: IndexInfo) -> core::result::Result<(), BestIndexError> {
         let mut has_source = false;
         for mut constraint in info.constraints() {
-            //println!("{} {}", constraint.icolumn(), constraint.usable());
             match column(constraint.column_idx()) {
                 Some(Columns::Source) => {
                     if constraint.usable() && constraint.op() == Some(ConstraintOperator::EQ) {
@@ -82,7 +77,7 @@ impl<'vtab> VTab<'vtab> for MetadataTable {
                         return Err(BestIndexError::Constraint);
                     }
                 }
-                _ => todo!(),
+                _ => (),
             }
         }
         if !has_source {
@@ -125,10 +120,15 @@ impl VTabCursor for MetadataCursor {
         _idx_str: Option<&str>,
         values: &[*mut sqlite3_value],
     ) -> Result<()> {
-        let path = api::value_text(values.get(0).unwrap())?;
-        println!("{path}");
-        let file = File::open(&path).unwrap();
-        let reader = SerializedFileReader::new(file).unwrap();
+        let path = api::value_text(values.get(0).ok_or_else(|| {
+            Error::new_message("missing source argument")
+        })?)?;
+        let file = File::open(&path).map_err(|e| {
+            Error::new_message(&format!("failed to open file '{}': {}", path, e))
+        })?;
+        let reader = SerializedFileReader::new(file).map_err(|e| {
+            Error::new_message(&format!("failed to read parquet file '{}': {}", path, e))
+        })?;
         let metadata = reader.metadata();
         self.metadata = Some(metadata.to_owned());
         self.done = false;
@@ -145,7 +145,9 @@ impl VTabCursor for MetadataCursor {
     }
 
     fn column(&self, context: *mut sqlite3_context, i: c_int) -> Result<()> {
-        let metadata = self.metadata.as_ref().unwrap();
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            Error::new_message("no metadata available")
+        })?;
 
         match column(i) {
             Some(Columns::Source) => (),
@@ -158,10 +160,12 @@ impl VTabCursor for MetadataCursor {
                 }
             }
             Some(Columns::Schema) => {
-                let schema = metadata.file_metadata().schema();
                 let mut buf = Vec::new();
-                printer::print_schema(&mut buf, schema);
-                api::result_text(context, String::from_utf8(buf).unwrap().as_str())?;
+                parquet::schema::printer::print_schema(&mut buf, metadata.file_metadata().schema());
+                let s = String::from_utf8(buf).map_err(|e| {
+                    Error::new_message(&format!("invalid utf8 in schema: {}", e))
+                })?;
+                api::result_text(context, &s)?;
             }
             Some(Columns::NumRows) => {
                 api::result_int64(context, metadata.file_metadata().num_rows());
@@ -172,16 +176,13 @@ impl VTabCursor for MetadataCursor {
                     metadata
                         .file_metadata()
                         .schema_descr()
-                        .num_columns()
-                        .try_into()
-                        .unwrap(),
+                        .num_columns() as i64,
                 );
             }
             Some(Columns::NumRowGroups) => {
-                api::result_int64(context, metadata.num_row_groups().try_into().unwrap());
+                api::result_int64(context, metadata.num_row_groups() as i64);
             }
-
-            None => todo!(),
+            None => (),
         }
         Ok(())
     }

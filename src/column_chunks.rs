@@ -12,14 +12,14 @@ use sqlite_loadable::{
 use std::{fs::File, mem, os::raw::c_int};
 
 static CREATE_SQL: &str = "CREATE TABLE x(
-      source hidden, 
-      row_group integer, 
-      column_name text, 
-      column_type text, 
+      source hidden,
+      row_group integer,
+      column_name text,
+      column_type text,
       num_values int,
       compressed_size int,
       uncompressed_size int,
-      stats_min, 
+      stats_min,
       stats_max,
       stats_distinct,
       stats_null_count
@@ -71,7 +71,6 @@ impl<'vtab> VTab<'vtab> for ColumnChunksTable {
     ) -> Result<(String, ColumnChunksTable)> {
         let base: sqlite3_vtab = unsafe { mem::zeroed() };
         let vtab = ColumnChunksTable { base };
-        // TODO db.config(VTabConfig::Innocuous)?;
         Ok((CREATE_SQL.to_owned(), vtab))
     }
     fn destroy(&self) -> Result<()> {
@@ -91,7 +90,7 @@ impl<'vtab> VTab<'vtab> for ColumnChunksTable {
                         return Err(BestIndexError::Constraint);
                     }
                 }
-                _ => todo!(),
+                _ => (),
             }
         }
         if !has_source {
@@ -138,10 +137,15 @@ impl VTabCursor for ColumnChunksCursor {
         _idx_str: Option<&str>,
         values: &[*mut sqlite3_value],
     ) -> Result<()> {
-        let path = api::value_text(values.get(0).unwrap())?;
-        println!("{path}");
-        let file = File::open(&path).unwrap();
-        let reader = SerializedFileReader::new(file).unwrap();
+        let path = api::value_text(values.get(0).ok_or_else(|| {
+            Error::new_message("missing source argument")
+        })?)?;
+        let file = File::open(&path).map_err(|e| {
+            Error::new_message(&format!("failed to open file '{}': {}", path, e))
+        })?;
+        let reader = SerializedFileReader::new(file).map_err(|e| {
+            Error::new_message(&format!("failed to read parquet file '{}': {}", path, e))
+        })?;
         let metadata = reader.metadata();
         self.metadata = Some(metadata.to_owned());
         self.eof = false;
@@ -151,20 +155,18 @@ impl VTabCursor for ColumnChunksCursor {
     }
 
     fn next(&mut self) -> Result<()> {
-        let curr_rowgroup = self
-            .metadata
-            .as_ref()
-            .unwrap()
-            .row_group(self.row_group_idx);
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            Error::new_message("no metadata available")
+        })?;
+        let curr_rowgroup = metadata.row_group(self.row_group_idx);
         self.column_idx += 1;
         if self.column_idx >= curr_rowgroup.columns().len() {
             self.column_idx = 0;
             self.row_group_idx += 1;
-            if self.row_group_idx >= self.metadata.as_ref().unwrap().num_row_groups() {
+            if self.row_group_idx >= metadata.num_row_groups() {
                 self.eof = true
             }
         }
-        //self.eof = self.current >= self.records.as_ref().unwrap().len();
         Ok(())
     }
 
@@ -173,33 +175,22 @@ impl VTabCursor for ColumnChunksCursor {
     }
 
     fn column(&self, context: *mut sqlite3_context, i: c_int) -> Result<()> {
-        let row_group = self
-            .metadata
-            .as_ref()
-            .unwrap()
-            .row_group(self.row_group_idx);
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            Error::new_message("no metadata available")
+        })?;
+        let row_group = metadata.row_group(self.row_group_idx);
         let column_chunk = row_group.column(self.column_idx);
 
-        // row_group.compressed_size()
-        // row_group.num_columns()
-        // row_group.num_rows()
-
-        //self.metadata.as_ref().unwrap().num_row_groups()
-        //self.metadata.as_ref().unwrap().file_metadata().version()
-        //self.metadata.as_ref().unwrap().file_metadata().created_by()
-        //self.metadata.as_ref().unwrap().file_metadata().num_rows()
-        //self.metadata.as_ref().unwrap().file_metadata().schema()
-        //self.metadata.as_ref().unwrap().file_metadata().schema().
         match column(i) {
             Some(Columns::RowGroup) => {
-                api::result_int(context, self.row_group_idx.try_into().unwrap());
+                api::result_int(context, self.row_group_idx as i32);
             }
             Some(Columns::Source) => (),
             Some(Columns::ColumnName) => {
-                api::result_text(context, column_chunk.column_path().to_string().as_str())?;
+                api::result_text(context, &column_chunk.column_path().to_string())?;
             }
             Some(Columns::ColumnType) => {
-                api::result_text(context, column_chunk.column_type().to_string().as_str())?;
+                api::result_text(context, &column_chunk.column_type().to_string())?;
             }
             Some(Columns::Values) => {
                 api::result_int64(context, column_chunk.num_values());
@@ -213,14 +204,32 @@ impl VTabCursor for ColumnChunksCursor {
             Some(Columns::StatsMin) => {
                 if let Some(stats) = column_chunk.statistics() {
                     match stats {
-                        Statistics::Int32(ref value) => api::result_int(context, *value.min()),
-                        Statistics::Int64(ref value) => api::result_int64(context, *value.min()),
-                        Statistics::Double(ref value) => api::result_double(context, *value.min()),
+                        Statistics::Int32(ref value) => {
+                            if let Some(min) = value.min_opt() {
+                                api::result_int(context, *min);
+                            }
+                        }
+                        Statistics::Int64(ref value) => {
+                            if let Some(min) = value.min_opt() {
+                                api::result_int64(context, *min);
+                            }
+                        }
+                        Statistics::Double(ref value) => {
+                            if let Some(min) = value.min_opt() {
+                                api::result_double(context, *min);
+                            }
+                        }
                         Statistics::Float(ref value) => {
-                            api::result_double(context, (*value.min()).into())
+                            if let Some(min) = value.min_opt() {
+                                api::result_double(context, (*min).into());
+                            }
                         }
                         Statistics::ByteArray(ref value) => {
-                            api::result_text(context, (*value.min()).as_utf8().unwrap())?
+                            if let Some(min) = value.min_opt() {
+                                if let Ok(s) = min.as_utf8() {
+                                    api::result_text(context, s)?;
+                                }
+                            }
                         }
                         _ => (),
                     };
@@ -229,14 +238,32 @@ impl VTabCursor for ColumnChunksCursor {
             Some(Columns::StatsMax) => {
                 if let Some(stats) = column_chunk.statistics() {
                     match stats {
-                        Statistics::Int32(ref value) => api::result_int(context, *value.max()),
-                        Statistics::Int64(ref value) => api::result_int64(context, *value.max()),
-                        Statistics::Double(ref value) => api::result_double(context, *value.max()),
+                        Statistics::Int32(ref value) => {
+                            if let Some(max) = value.max_opt() {
+                                api::result_int(context, *max);
+                            }
+                        }
+                        Statistics::Int64(ref value) => {
+                            if let Some(max) = value.max_opt() {
+                                api::result_int64(context, *max);
+                            }
+                        }
+                        Statistics::Double(ref value) => {
+                            if let Some(max) = value.max_opt() {
+                                api::result_double(context, *max);
+                            }
+                        }
                         Statistics::Float(ref value) => {
-                            api::result_double(context, (*value.max()).into())
+                            if let Some(max) = value.max_opt() {
+                                api::result_double(context, (*max).into());
+                            }
                         }
                         Statistics::ByteArray(ref value) => {
-                            api::result_text(context, (*value.max()).as_utf8().unwrap())?
+                            if let Some(max) = value.max_opt() {
+                                if let Ok(s) = max.as_utf8() {
+                                    api::result_text(context, s)?;
+                                }
+                            }
                         }
                         _ => (),
                     };
@@ -244,17 +271,19 @@ impl VTabCursor for ColumnChunksCursor {
             }
             Some(Columns::StatsDistinct) => {
                 if let Some(stats) = column_chunk.statistics() {
-                    if let Some(distinct) = stats.distinct_count() {
-                        api::result_int64(context, distinct.try_into().unwrap());
+                    if let Some(distinct) = stats.distinct_count_opt() {
+                        api::result_int64(context, distinct as i64);
                     }
                 }
             }
             Some(Columns::StatsNullCount) => {
                 if let Some(stats) = column_chunk.statistics() {
-                    api::result_int64(context, stats.null_count().try_into().unwrap());
+                    if let Some(null_count) = stats.null_count_opt() {
+                        api::result_int64(context, null_count as i64);
+                    }
                 }
             }
-            None => todo!(),
+            None => (),
         }
         Ok(())
     }

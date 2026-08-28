@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sqlite-loadable = "0.0.5"
-parquet = {version="24.0.0", features=["json"]}
+sqlite-loadable = {path="../sqlite-loadable-rs", features=["exec"]}
+parquet = {version="57.3.0", default-features=false, features=["arrow", "json", "snap", "zstd"]}
+arrow = {version="57.3.0", default-features=false}
 chrono = "0.4"
-serde_json = "1.0.87"
+serde_json = "1.0"
+glob = "0.3"
 
 [lib]
 crate-type=["lib", "cdylib", "staticlib"]
